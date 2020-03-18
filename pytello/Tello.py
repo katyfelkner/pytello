@@ -21,6 +21,7 @@ import time
 import cv2
 import os
 from os.path import join
+import numpy as np
 import subprocess
 from pytello.utils.NonBlockingStreamReader import NonBlockingStreamReader
 from pytello.TelloVideoGUI import TelloVideoGUI
@@ -693,6 +694,10 @@ class Tello:
         # initialize a buffer (will contain the last buffer_size vision objects)
         self.buffer = [None] * self.buffer_size
         self.buffer_index = 0
+        self.fifo_path = '/tmp/video_fifo'
+        if os.path.exists(self.fifo_path):
+            os.remove(self.fifo_path)
+        os.mkfifo(self.fifo_path)
 
         # setup the thread for monitoring the vision (but don't start it until we connect in open_video)
         self.vision_thread = threading.Thread(target=self._buffer_vision,
@@ -752,7 +757,7 @@ class Tello:
         # the first step is to open the rtsp stream through ffmpeg first
         # this step creates a directory full of images, one per frame
         self.ffmpeg_process = \
-                subprocess.Popen("ffmpeg -i udp://192.168.10.1:11111 -r 30 image_%03d.png &",
+                subprocess.Popen("ffmpeg -i udp://192.168.10.1:11111 -r 30 -c:v png -f image2pipe pipe:/tmp/video_fifo &",
                                  shell=True, cwd=self.imagePath, stderr=subprocess.PIPE, stdout=subprocess.PIPE)
 
         # immediately start the vision buffering (before we even know if it succeeded since waiting puts us behind)
@@ -846,29 +851,32 @@ class Tello:
         # start with no new data
         self.new_frame = False
 
-        # when the method is first called, sometimes there is already data to catch up on
-        # so find the latest image in the directory and set the index to that
-        found_latest = False
-        while (not found_latest):
-            path = "%s/image_%03d.png" % (self.imagePath, self.image_index)
-            if (os.path.exists(path)) and (not os.path.isfile(path)):
+        ## when the method is first called, sometimes there is already data to catch up on
+        ## so find the latest image in the directory and set the index to that
+        ##while (not found_latest):
+            #path = "%s/image_%03d.png" % (self.imagePath, self.image_index)
+            #if (os.path.exists(path)) and (not os.path.isfile(path)):
                 # just increment through it (don't save any of these first images)
-                self.image_index = self.image_index + 1
-            else:
-                found_latest = True
+                #self.image_index = self.image_index + 1
+            #else:
+                #found_latest = True
 
         # run forever, trying to grab the latest image
         while (self.vision_running):
+            # showing is handled in the main thread for now.
+            # This thread buffers frames for the user vision thread
             # grab the latest image from the ffmpeg stream
             try:
                 # make the name for the next image
-                path = "%s/image_%03d.png" % (self.imagePath, self.image_index)
-                if (not os.path.exists(path)) and (not os.path.isfile(path)):
+                #path = "%s/image_%03d.png" % (self.imagePath, self.image_index)
+                #if (not os.path.exists(path)) and (not os.path.isfile(path)):
                     # print("File %s doesn't exist" % (path))
                     # print(os.listdir(self.imagePath))
-                    continue
+                    #continue
 
-                img = cv2.imread(path, 1)
+                img = cv2.imread(self.fifo_path, 1)
+
+
 
                 # sometimes cv2 returns a None object so skip putting those in the array
                 if (img is not None):
@@ -881,9 +889,11 @@ class Tello:
                     self.buffer[self.buffer_index] = img
                     self.new_frame = True
 
-            except cv2.error:
+            except (cv2.error, SystemError):
                 # Assuming its an empty image, so decrement the index and try again.
-                print("Trying to read an empty png. Let's wait and try again.")
+                # we are ignoring SystemError to suppress some stuff in the C++ bindings
+                # until the 2 threads are caught up and we actually have video
+                #print("Trying to read an empty png. Let's wait and try again.")
                 self.image_index = self.image_index - 1
                 continue
 
@@ -909,9 +919,46 @@ class Tello:
 
         # kill the ffmpeg subprocess
         self.ffmpeg_process.kill()
-
+        # sometimes you gotta kill it again for some reason
+        try:
+            self.ffmpeg_process.kill()
+        except:
+            pass
+        os.unlink(self.fifo_path)
         self._send_command_wait_for_response("streamoff")
 
+if __name__ == "__main__":
+    # make my drone object
+    drone = Tello(video=True)
 
+    # connect to the tello
+    success = drone.connect()
+
+    # turn on the video
+    drone.open_video()
+
+    start_time = datetime.now()
+    now = datetime.now()
+    time_elapsed = (now - start_time).seconds
+    cv2.startWindowThread()
+    cv2.namedWindow("drone")
+    pipe = open(drone.fifo_path, mode='rb')
+    while (time_elapsed <= 30):
+        try:
+            marker_img = cv2.imread(pipe, 1)
+            if marker_img is not None:
+                cv2.imshow("drone", marker_img)
+                cv2.waitKey(1)
+        except (cv2.error, SystemError, UnicodeDecodeError):
+            # wait for us to actually have images
+            pass
+        print("running main loop")
+        time.sleep(0.1)
+        now = datetime.now()
+        time_elapsed = (now - start_time).seconds
+
+    drone.close_video()
+
+    drone.disconnect()
 
 
