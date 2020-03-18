@@ -89,7 +89,7 @@ if __name__ == "__main__":
     drone = Tello(video=True)
 
     # connect to the tello
-    success = drone.connect(5)
+    success = drone.connect()
 
     # turn on the video
     drone.open_video()
